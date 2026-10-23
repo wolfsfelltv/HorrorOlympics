@@ -1,0 +1,13 @@
+name: HorrorOlympics
+version: '0.1.0-alpha'
+main: de.wolfsfell.horrorolympics.HorrorOlympics
+api-version: '1.21.11'
+author: WolfsfellTV
+commands:
+  ho:
+    description: Horror Olympics event controller
+    usage: /ho help
+permissions:
+  horrorolympics.admin:
+    description: Event administration
+    default: op
