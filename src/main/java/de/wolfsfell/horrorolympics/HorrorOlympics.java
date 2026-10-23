@@ -10,6 +10,13 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.*;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.block.Block;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -25,6 +32,17 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
     private final Set<UUID> eliminated = new HashSet<>();
     private final Map<UUID, PlayerState> savedStates = new HashMap<>();
     private UUID hunterId;
+    private String activeGame = "";
+    private int elapsed = 0;
+    private boolean teacherWatching = false;
+    private final Map<UUID, Integer> roundScore = new HashMap<>();
+    private final Map<UUID, Set<String>> collected = new HashMap<>();
+    private final Map<UUID, Location> lastSafe = new HashMap<>();
+    private final Set<UUID> hidden = new HashSet<>();
+    private final Set<UUID> finished = new HashSet<>();
+    private final Set<UUID> scored = new HashSet<>();
+    private final List<String> bingoItems = List.of("skull", "bone", "candle", "beer", "eye");
+    private static final int GAME_LENGTH = 480;
     private boolean running = false;
     private BukkitTask roundTask;
     private int secondsLeft;
@@ -63,7 +81,9 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
             tell(sender, "/ho join | leave | lobby | points [Spieler]");
             if (sender.hasPermission("horrorolympics.admin")) {
                 tell(sender, "/ho setlobby | arena <name> <pos1|pos2|spawn|hunter|spectator|show>");
-                tell(sender, "/ho hunter <Spieler> | start apored | stop | status");
+                tell(sender, "/ho hunter <Spieler> | start <apored|hotel|supermarkt|schule|friedhof> | stop | status");
+                tell(sender, "/ho marker <hotel closet|supermarkt crate|supermarkt checkout|schule finish|friedhof skull|bone|candle|beer|eye|delivery> [add]");
+                tell(sender, "/ho revive <Spieler>");
                 tell(sender, "/ho points <set|add|remove> <Spieler> <Zahl>");
             }
             return true;
@@ -120,8 +140,32 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
             }
             case "start" -> {
                 if (!admin(sender)) return true;
-                if (a.length < 2 || !a[1].equalsIgnoreCase("apored")) { tell(sender, "Alpha 1 unterstützt zunächst nur /ho start apored."); return true; }
-                startApoRed(sender);
+                if (a.length < 2 || !isArena(a[1])) { tell(sender, "Nutze /ho start <apored|hotel|supermarkt|schule|friedhof>."); return true; }
+                if (a[1].equalsIgnoreCase("apored")) startApoRed(sender);
+                else startGame(sender, a[1].toLowerCase(Locale.ROOT));
+            }
+            case "revive" -> {
+                if (!admin(sender)) return true;
+                if (!running || a.length < 2 || find(a[1]) == null) { tell(sender, "Nutze während einer Runde /ho revive <Online-Spieler>."); return true; }
+                Player p = find(a[1]); UUID id = p.getUniqueId();
+                if (!eliminated.remove(id)) { tell(sender, "Spieler ist nicht ausgeschieden."); return true; }
+                Location spawn = readLocation("arenas." + activeGame + ".spawn");
+                if (spawn != null) p.teleport(spawn);
+                p.setGameMode(GameMode.ADVENTURE); tell(sender, p.getName() + " ist wieder dabei.");
+            }
+            case "marker" -> {
+                if (!admin(sender)) return true;
+                if (!(sender instanceof Player p)) return true;
+                if (running) { tell(sender, "Nicht während einer Runde markieren."); return true; }
+                if (a.length < 3 || !isArena(a[1])) { tell(sender, "/ho marker <arena> <typ> [add]"); return true; }
+                String arena = a[1].toLowerCase(Locale.ROOT), type = a[2].toLowerCase(Locale.ROOT);
+                if (!validMarker(arena, type)) { tell(sender, "Ungültiger Marker für diese Arena."); return true; }
+                String path = "markers." + arena + "." + type;
+                if (a.length > 3 && a[3].equalsIgnoreCase("add")) {
+                    List<Location> list = new ArrayList<>(getConfig().getLocationList(path));
+                    list.add(p.getLocation()); getConfig().set(path, list); saveConfig();
+                    tell(sender, arena + "/" + type + ": Punkt " + list.size() + " gespeichert.");
+                } else { setLocation(path, p); tell(sender, arena + "/" + type + " gespeichert."); }
             }
             case "stop" -> { if (admin(sender)) { stopRound(true); tell(sender, "Runde beendet und Spieler zurückgesetzt."); } }
             case "status" -> {
@@ -179,7 +223,7 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
         savedStates.clear(); eliminated.clear();
         savedStates.put(hunterId, new PlayerState(hunter));
         for (Player p : players) savedStates.put(p.getUniqueId(), new PlayerState(p));
-        running = true; secondsLeft = 8 * 60;
+        running = true; activeGame = "apored"; elapsed = 0; roundScore.clear(); scored.clear(); secondsLeft = 8 * 60;
         for (Player p : players) { p.teleport(spawn); p.setGameMode(GameMode.ADVENTURE); p.sendTitle(ChatColor.DARK_RED + "VERSTECK DICH!", "30 Sekunden Vorsprung", 10, 60, 10); }
         hunter.teleport(hunterSpawn); hunter.setGameMode(GameMode.ADVENTURE);
         hunter.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 30 * 20, 1, false, false));
@@ -192,7 +236,7 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
         final int[] ticks = {0};
         roundTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (!running) return;
-            ticks[0]++;
+            ticks[0]++; elapsed = ticks[0];
             if (ticks[0] == 30) {
                 hunter.removePotionEffect(PotionEffectType.BLINDNESS);
                 hunter.removePotionEffect(PotionEffectType.SLOWNESS);
@@ -201,7 +245,7 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
             if (ticks[0] > 30) {
                 secondsLeft--;
                 if (secondsLeft % 60 == 0 && secondsLeft > 0) broadcast("Noch " + secondsLeft / 60 + " Minuten!");
-                if (secondsLeft <= 0) { broadcast(ChatColor.GREEN + "Zeit abgelaufen! Überlebende gewinnen."); stopRound(false); }
+                if (secondsLeft <= 0) { broadcast(ChatColor.GREEN + "Zeit abgelaufen! Überlebende gewinnen."); awardSurvivors(); stopRound(false); }
             }
         }, 20L, 20L);
     }
@@ -215,6 +259,7 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
     }
     @EventHandler(ignoreCancelled = true) public void onDamage(EntityDamageByEntityEvent e) {
         if (!running || !(e.getEntity() instanceof Player victim)) return;
+        if (!activeGame.equals("apored")) { if (participants.contains(victim.getUniqueId())) e.setCancelled(true); return; }
         if (!(e.getDamager() instanceof Player attacker)) {
             if (participants.contains(victim.getUniqueId())) e.setCancelled(true);
             return;
@@ -223,34 +268,180 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
         if (!attacker.getUniqueId().equals(hunterId) || !participants.contains(victim.getUniqueId()) || eliminated.contains(victim.getUniqueId())) return;
         if (!attacker.getInventory().getItemInMainHand().isSimilar(sneaker())) return;
         if (!inside(victim.getLocation(), readLocation("arenas.apored.pos1"), readLocation("arenas.apored.pos2"))) return;
-        eliminated.add(victim.getUniqueId());
-        victim.setGameMode(GameMode.SPECTATOR);
-        Location spec = readLocation("arenas.apored.spectator"); if (spec != null) victim.teleport(spec);
+        eliminate(victim);
         victim.getWorld().spawnParticle(Particle.DAMAGE_INDICATOR, victim.getLocation().add(0, 1, 0), 30, .5, .5, .5, .2);
         broadcast(ChatColor.RED + victim.getName() + " wurde von ApoReds Sneaker erwischt! " + ChatColor.GRAY + "(" + (participants.size() - eliminated.size()) + " übrig)");
-        if (eliminated.size() >= onlineParticipants()) { broadcast("Alle gefunden! ApoRed gewinnt!"); stopRound(false); }
+        if (aliveCount() == 0) { broadcast("Alle gefunden! ApoRed gewinnt!"); stopRound(false); }
     }
     private int onlineParticipants() { int n = 0; for (UUID id : participants) if (Bukkit.getPlayer(id) != null) n++; return n; }
     @EventHandler public void onQuit(PlayerQuitEvent e) {
         if (!running) return;
         UUID id = e.getPlayer().getUniqueId();
-        if (id.equals(hunterId)) { broadcast("ApoRed hat den Server verlassen. Runde abgebrochen."); stopRound(false); }
+        if (activeGame.equals("apored") && id.equals(hunterId)) { broadcast("ApoRed hat den Server verlassen. Runde abgebrochen."); stopRound(false); }
         else if (participants.contains(id)) {
             eliminated.add(id);
-            if (eliminated.size() >= onlineParticipants()) { broadcast("Keine Teilnehmer mehr aktiv."); stopRound(false); }
+            if (aliveCount() == 0) { broadcast("Keine Teilnehmer mehr aktiv."); stopRound(false); }
         }
     }
     private void stopRound(boolean announce) {
         if (roundTask != null) { roundTask.cancel(); roundTask = null; }
         if (!running && savedStates.isEmpty()) return;
-        running = false;
+        running = false; activeGame = ""; hidden.clear(); collected.clear(); finished.clear(); lastSafe.clear();
         for (Map.Entry<UUID, PlayerState> entry : savedStates.entrySet()) {
             Player p = Bukkit.getPlayer(entry.getKey());
             if (p != null) entry.getValue().restore(p);
         }
-        savedStates.clear(); eliminated.clear();
+        savedStates.clear(); eliminated.clear(); roundScore.clear(); scored.clear();
         if (announce) broadcast("Runde gestoppt.");
     }
+
+    private boolean validMarker(String arena, String type) {
+        return switch (arena) {
+            case "hotel" -> type.equals("closet");
+            case "supermarkt" -> List.of("crate", "checkout").contains(type);
+            case "schule" -> type.equals("finish");
+            case "friedhof" -> bingoItems.contains(type) || type.equals("delivery");
+            default -> false;
+        };
+    }
+    private List<Location> markerLocations(String arena, String type) {
+        String path = "markers." + arena + "." + type;
+        List<Location> result = new ArrayList<>(getConfig().getLocationList(path));
+        Location single = readLocation(path);
+        if (single != null) result.add(single);
+        return result;
+    }
+    private boolean near(Location player, Location marker, double radius) {
+        return marker != null && Objects.equals(player.getWorld(), marker.getWorld()) && player.distanceSquared(marker) <= radius * radius;
+    }
+    private boolean nearAny(Location location, String arena, String type, double radius) {
+        for (Location marker : markerLocations(arena, type)) if (near(location, marker, radius)) return true;
+        return false;
+    }
+    private int aliveCount() {
+        int n = 0;
+        for (UUID id : participants) if (Bukkit.getPlayer(id) != null && !eliminated.contains(id)) n++;
+        return n;
+    }
+    private void score(Player p, int amount) {
+        UUID id = p.getUniqueId();
+        points.merge(id, amount, Integer::sum); savePoints();
+        tell(p, ChatColor.LIGHT_PURPLE + "+" + amount + " Punkte! Gesamt: " + points.get(id));
+    }
+    private void eliminate(Player p) {
+        if (!eliminated.add(p.getUniqueId())) return;
+        hidden.remove(p.getUniqueId());
+        if (activeGame.equals("apored")) score(p, Math.max(0, elapsed - 30) / 20);
+        p.setGameMode(GameMode.ADVENTURE);
+        Location lobby = readLocation("lobby"); if (lobby != null) p.teleport(lobby);
+        p.sendTitle(ChatColor.RED + "AUSGESCHIEDEN", "Nächste Runde wieder dabei", 5, 50, 10);
+    }
+    private void awardSurvivors() {
+        for (UUID id : participants) {
+            Player p = Bukkit.getPlayer(id);
+            if (p != null && !eliminated.contains(id) && scored.add(id)) score(p, 30);
+        }
+    }
+    private void startGame(CommandSender sender, String game) {
+        if (running) { tell(sender, "Es läuft schon eine Runde."); return; }
+        Location spawn = readLocation("arenas." + game + ".spawn");
+        if (spawn == null || readLocation("lobby") == null) { tell(sender, "Arena-Spawn oder Lobby fehlt."); return; }
+        if (participants.isEmpty()) { tell(sender, "Erst /ho join benutzen."); return; }
+        if (game.equals("hotel") && markerLocations("hotel", "closet").isEmpty()) { tell(sender, "Markiere Schränke mit /ho marker hotel closet add."); return; }
+        if (game.equals("supermarkt") && (markerLocations(game, "crate").isEmpty() || markerLocations(game, "checkout").isEmpty())) { tell(sender, "Markiere Kisten und Kasse."); return; }
+        if (game.equals("schule") && markerLocations(game, "finish").isEmpty()) { tell(sender, "Markiere die Ziellinie."); return; }
+        if (game.equals("friedhof")) {
+            for (String type : bingoItems) if (markerLocations(game, type).isEmpty()) { tell(sender, "Fehlt: /ho marker friedhof " + type + " add"); return; }
+            if (markerLocations(game, "delivery").isEmpty()) { tell(sender, "Fehlt: /ho marker friedhof delivery"); return; }
+        }
+        savedStates.clear(); eliminated.clear(); hidden.clear(); finished.clear(); collected.clear(); roundScore.clear(); scored.clear();
+        for (UUID id : participants) {
+            Player p = Bukkit.getPlayer(id);
+            if (p == null) continue;
+            savedStates.put(id, new PlayerState(p)); p.teleport(spawn); p.setGameMode(GameMode.ADVENTURE);
+            p.getInventory().clear();
+        }
+        if (savedStates.isEmpty()) { tell(sender, "Keine Teilnehmer online."); return; }
+        running = true; activeGame = game; elapsed = 0; secondsLeft = GAME_LENGTH; teacherWatching = false;
+        broadcast(ChatColor.DARK_PURPLE + game.toUpperCase(Locale.ROOT) + " beginnt!");
+        roundTask = Bukkit.getScheduler().runTaskTimer(this, () -> tickGame(game), 20L, 20L);
+    }
+    private void tickGame(String game) {
+        if (!running || !activeGame.equals(game)) return;
+        elapsed++; secondsLeft--;
+        if (game.equals("hotel")) {
+            int phase = elapsed % 45;
+            if (phase == 25) { hidden.clear(); broadcast(ChatColor.RED + "MONSTER KOMMT IN 10 SEKUNDEN! Rechtsklick am Schrank!"); }
+            if (phase == 35) {
+                for (UUID id : participants) {
+                    Player p = Bukkit.getPlayer(id);
+                    if (p != null && !eliminated.contains(id) && !hidden.contains(id)) eliminate(p);
+                }
+                broadcast(ChatColor.RED + "Das Monster ist vorbeigezogen!");
+            }
+            if (phase == 40) hidden.clear();
+        }
+        if (game.equals("schule")) {
+            if (elapsed % 12 == 0) {
+                teacherWatching = !teacherWatching;
+                broadcast(teacherWatching ? ChatColor.RED + "LEHRER SCHAUT! STILLSTEHEN!" : ChatColor.GREEN + "LEHRER SCHAUT WEG! LAUFEN!");
+            }
+        }
+        if (game.equals("supermarkt") && elapsed == 120) broadcast(ChatColor.DARK_RED + "LICHT AUS! Der Hausmeister kommt!");
+        if (game.equals("friedhof") && elapsed == 90) broadcast(ChatColor.DARK_RED + "Der Totengräber ist jetzt unterwegs!");
+        if (secondsLeft % 60 == 0 && secondsLeft > 0) broadcast("Noch " + secondsLeft / 60 + " Minuten.");
+        if (secondsLeft <= 0 || aliveCount() == 0) {
+            if (game.equals("hotel") || game.equals("schule")) awardSurvivors();
+            broadcast(ChatColor.GOLD + "Runde beendet!"); stopRound(false);
+        }
+    }
+    @EventHandler public void onMove(PlayerMoveEvent e) {
+        if (!running || !participants.contains(e.getPlayer().getUniqueId()) || eliminated.contains(e.getPlayer().getUniqueId())) return;
+        if (e.getTo() == null || e.getFrom().getBlockX() == e.getTo().getBlockX() && e.getFrom().getBlockY() == e.getTo().getBlockY() && e.getFrom().getBlockZ() == e.getTo().getBlockZ()) return;
+        Player p = e.getPlayer(); UUID id = p.getUniqueId();
+        if (activeGame.equals("hotel") && hidden.contains(id)) { e.setTo(e.getFrom()); return; }
+        if (activeGame.equals("schule")) {
+            if (teacherWatching) { eliminate(p); return; }
+            if (nearAny(e.getTo(), "schule", "finish", 2.5) && finished.add(id)) {
+                score(p, 40); eliminate(p); broadcast(ChatColor.GREEN + p.getName() + " hat das Ziel erreicht!");
+            }
+        }
+    }
+    @EventHandler public void onInteract(PlayerInteractEvent e) {
+        if (!running || !participants.contains(e.getPlayer().getUniqueId()) || eliminated.contains(e.getPlayer().getUniqueId())) return;
+        if (e.getAction() != Action.RIGHT_CLICK_BLOCK && e.getAction() != Action.RIGHT_CLICK_AIR) return;
+        Player p = e.getPlayer(); UUID id = p.getUniqueId(); Location loc = p.getLocation();
+        if (activeGame.equals("hotel") && elapsed % 45 >= 25 && elapsed % 45 < 40 && nearAny(loc, "hotel", "closet", 2.5)) {
+            if (hidden.add(id)) tell(p, ChatColor.GREEN + "Du bist im Schrank versteckt. Nicht bewegen!");
+            e.setCancelled(true);
+        }
+        if (activeGame.equals("supermarkt")) {
+            if (nearAny(loc, "supermarkt", "crate", 2.5) && !collected.computeIfAbsent(id, k -> new HashSet<>()).contains("carrying")) {
+                collected.get(id).add("carrying"); tell(p, "Bierkasten aufgenommen! Bring ihn zur Kasse."); e.setCancelled(true);
+            } else if (nearAny(loc, "supermarkt", "checkout", 2.5) && collected.computeIfAbsent(id, k -> new HashSet<>()).remove("carrying")) {
+                roundScore.merge(id, 1, Integer::sum); score(p, 5); tell(p, "Kasten abgegeben: " + roundScore.get(id)); e.setCancelled(true);
+            }
+        }
+        if (activeGame.equals("friedhof")) {
+            Set<String> bag = collected.computeIfAbsent(id, k -> new HashSet<>());
+            for (String type : bingoItems) if (!bag.contains(type) && nearAny(loc, "friedhof", type, 2.5)) {
+                bag.add(type); tell(p, "Gefunden: " + type + " (" + bag.size() + "/5)"); e.setCancelled(true); break;
+            }
+            if (bag.size() == 5 && nearAny(loc, "friedhof", "delivery", 2.5) && finished.add(id)) {
+                score(p, 50); broadcast(ChatColor.GOLD + p.getName() + " hat Friedhof-Bingo geschafft!"); eliminate(p);
+            }
+        }
+    }
+    @EventHandler public void onEnvironmentalDamage(EntityDamageEvent e) {
+        if (!running || !(e.getEntity() instanceof Player p) || !participants.contains(p.getUniqueId())) return;
+        e.setCancelled(true);
+    }
+    @EventHandler public void onRejoin(PlayerJoinEvent e) {
+        if (running && eliminated.contains(e.getPlayer().getUniqueId())) {
+            Location lobby = readLocation("lobby"); if (lobby != null) Bukkit.getScheduler().runTask(this, () -> e.getPlayer().teleport(lobby));
+        }
+    }
+
     private static final class PlayerState {
         private final GameMode mode; private final Location location;
         private final ItemStack[] inventory, armor; private final ItemStack offHand;
@@ -275,11 +466,16 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
         }
     }
     @Override public List<String> onTabComplete(CommandSender s, Command c, String alias, String[] a) {
-        if (a.length == 1) return match(a[0], s.hasPermission("horrorolympics.admin") ? List.of("help", "join", "leave", "lobby", "setlobby", "arena", "hunter", "start", "stop", "status", "points") : List.of("help", "join", "leave", "lobby", "points"));
+        if (a.length == 1) return match(a[0], s.hasPermission("horrorolympics.admin") ? List.of("help", "join", "leave", "lobby", "setlobby", "arena", "marker", "hunter", "revive", "start", "stop", "status", "points") : List.of("help", "join", "leave", "lobby", "points"));
         if (a.length == 2 && a[0].equalsIgnoreCase("arena")) return match(a[1], ARENAS);
         if (a.length == 3 && a[0].equalsIgnoreCase("arena")) return match(a[2], List.of("pos1", "pos2", "spawn", "hunter", "spectator", "show"));
         if (a.length == 2 && a[0].equalsIgnoreCase("points")) return match(a[1], List.of("set", "add", "remove"));
-        if (a.length == 2 && a[0].equalsIgnoreCase("start")) return match(a[1], List.of("apored"));
+        if (a.length == 2 && a[0].equalsIgnoreCase("start")) return match(a[1], ARENAS);
+        if (a.length == 2 && a[0].equalsIgnoreCase("marker")) return match(a[1], ARENAS);
+        if (a.length == 3 && a[0].equalsIgnoreCase("marker")) return match(a[2], switch (a[1].toLowerCase(Locale.ROOT)) {
+            case "hotel" -> List.of("closet"); case "supermarkt" -> List.of("crate", "checkout");
+            case "schule" -> List.of("finish"); case "friedhof" -> List.of("skull", "bone", "candle", "beer", "eye", "delivery"); default -> List.of(); });
+        if (a.length == 2 && a[0].equalsIgnoreCase("revive")) return match(a[1], Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
         if (a.length == 2 && a[0].equalsIgnoreCase("hunter")) return match(a[1], Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
         if (a.length == 3 && a[0].equalsIgnoreCase("points")) return match(a[2], Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
         return List.of();

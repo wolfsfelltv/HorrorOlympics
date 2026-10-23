@@ -1,5 +1,5 @@
 name: HorrorOlympics
-version: '0.1.0-alpha'
+version: '0.2.0-alpha'
 main: de.wolfsfell.horrorolympics.HorrorOlympics
 api-version: '1.21.11'
 author: WolfsfellTV
