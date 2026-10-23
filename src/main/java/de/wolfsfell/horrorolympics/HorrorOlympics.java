@@ -162,7 +162,7 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
                 if (!validMarker(arena, type)) { tell(sender, "Ungültiger Marker für diese Arena."); return true; }
                 String path = "markers." + arena + "." + type;
                 if (a.length > 3 && a[3].equalsIgnoreCase("add")) {
-                    List<Location> list = new ArrayList<>(getConfig().getLocationList(path));
+                    List<Location> list = new ArrayList<>(getConfig().getList(path, List.of()).stream().filter(Location.class::isInstance).map(Location.class::cast).toList());
                     list.add(p.getLocation()); getConfig().set(path, list); saveConfig();
                     tell(sender, arena + "/" + type + ": Punkt " + list.size() + " gespeichert.");
                 } else { setLocation(path, p); tell(sender, arena + "/" + type + " gespeichert."); }
@@ -306,7 +306,7 @@ public final class HorrorOlympics extends JavaPlugin implements Listener, Comman
     }
     private List<Location> markerLocations(String arena, String type) {
         String path = "markers." + arena + "." + type;
-        List<Location> result = new ArrayList<>(getConfig().getLocationList(path));
+        List<Location> result = new ArrayList<>(getConfig().getList(path, List.of()).stream().filter(Location.class::isInstance).map(Location.class::cast).toList());
         Location single = readLocation(path);
         if (single != null) result.add(single);
         return result;
